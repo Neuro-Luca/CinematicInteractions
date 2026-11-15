@@ -4,6 +4,7 @@ import dev.dyslexic.cinematic.table.TableGrid;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import javax.annotation.Nullable;
@@ -113,10 +114,29 @@ final class TableRecipeGuide {
         for (int i = 0; !changed && i < next.size(); i++) changed = !ItemStack.matches(next.get(i), snapshot.get(i));
         if (!changed) return;
         snapshot = next;
-        List<ItemStack> pool = units(next);
+        // For recipe availability, keep item quantities instead of expanding every stack
+        // into up to nine identical vertices for every recipe.
+        List<ItemStack> kinds = new ArrayList<>();
+        List<Integer> counts = new ArrayList<>();
+        for (ItemStack stack : next) {
+            if (stack.isEmpty()) continue;
+            int kind = -1;
+            for (int k = 0; k < kinds.size(); k++) {
+                // Preserve the count when grouping; custom ingredients can inspect it.
+                if (ItemStack.matches(kinds.get(k), stack)) { kind = k; break; }
+            }
+            if (kind == -1) {
+                kinds.add(stack);
+                counts.add(Math.min(9, stack.getCount()));
+            } else {
+                counts.set(kind, Math.min(9, counts.get(kind) + stack.getCount()));
+            }
+        }
+        int[] stock = counts.stream().mapToInt(Integer::intValue).toArray();
+        // Cache Ingredient.test for the same ingredient and item kind in this refresh.
+        IdentityHashMap<Ingredient, boolean[]> testCache = new IdentityHashMap<>();
         for (Entry entry : entries) {
-            int[] assignment = match(entry.ingredients, pool);
-            entry.craftable = Arrays.stream(assignment).allMatch(i -> i >= 0);
+            entry.craftable = canCraftFast(entry.ingredients, kinds, stock, testCache);
         }
         refresh();
         revision++;
@@ -617,6 +637,51 @@ final class TableRecipeGuide {
         return !actual(logical).isEmpty() && !placed[logical];
     }
 
+    /** Capacity-aware matching for the recipe list. Keeps full matching for layout/preview. */
+    private static boolean canCraftFast(List<Ingredient> ingredients, List<ItemStack> kinds, int[] stock,
+            IdentityHashMap<Ingredient, boolean[]> testCache) {
+        int total = 0;
+        for (int quantity : stock) total += quantity;
+        if (ingredients.size() > total) return false;
+        int[] owner = new int[ingredients.size()];
+        int[] used = new int[kinds.size()];
+        Arrays.fill(owner, -1);
+        for (int i = 0; i < ingredients.size(); i++) {
+            if (!assignKind(i, ingredients, kinds, stock, used, owner, testCache, new boolean[kinds.size()])) {
+                return false;
+            }
+        }
+        return true;
+    }
+    /** Augmenting path with per-kind capacity, respecting flexible tag ingredients. */
+    private static boolean assignKind(int target, List<Ingredient> ingredients, List<ItemStack> kinds,
+            int[] stock, int[] used, int[] owner, IdentityHashMap<Ingredient, boolean[]> testCache, boolean[] seen) {
+        Ingredient ingredient = ingredients.get(target);
+        boolean[] compatible = testCache.get(ingredient);
+        if (compatible == null) {
+            compatible = new boolean[kinds.size()];
+            for (int k = 0; k < kinds.size(); k++) compatible[k] = ingredient.test(kinds.get(k));
+            testCache.put(ingredient, compatible);
+        }
+        for (int k = 0; k < kinds.size(); k++) {
+            if (seen[k] || !compatible[k]) continue;
+            seen[k] = true;
+            if (used[k] < stock[k]) {
+                used[k]++;
+                owner[target] = k;
+                return true;
+            }
+            // No free unit: move an already assigned ingredient to another kind.
+            for (int previous = 0; previous < owner.length; previous++) {
+                if (owner[previous] == k && assignKind(previous, ingredients, kinds, stock,
+                        used, owner, testCache, seen)) {
+                    owner[target] = k;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
     private static List<ItemStack> units(List<ItemStack> stacks) {
         List<ItemStack> result = new ArrayList<>();
         // No crafting recipe consumes more than nine units, even if the source stack contains thousands.
